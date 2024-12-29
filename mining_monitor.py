@@ -133,6 +133,9 @@ def display_live_info(stdscr):
             break
         elif key == ord('c'):
             configure_gpu(nvml)
+         # Pause pour ajuster le taux de rafraîchissement
+        time.sleep(5)
+
 
 def configure_gpu(nvml):
     """Allow user to configure GPU settings."""
