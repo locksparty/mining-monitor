@@ -2,10 +2,15 @@ import os
 import psutil
 import platform
 from tabulate import tabulate
-import subprocess
 from ctypes import *
 from ctypes.util import find_library
 import cpuinfo
+import time
+import curses
+
+############################################
+# Core NVML functionality derived from py-nvtool
+############################################
 
 class NVMLWrapper:
     def __init__(self):
@@ -23,7 +28,7 @@ class NVMLWrapper:
         power_usage = c_uint()
         try:
             self.nvml_lib.nvmlDeviceGetPowerUsage(handle, byref(power_usage))
-            return power_usage.value / 1000
+            return power_usage.value / 1000  # Convert from milliwatts to watts
         except:
             return None
 
@@ -42,7 +47,7 @@ class NVMLWrapper:
             gpus.append({
                 "id": idx,
                 "name": name.value.decode(),
-                "memory": memory_info["total"] // (1024 ** 2),
+                "memory": memory_info["total"] // (1024 ** 2),  # Convert to MB
                 "power_limit": power_limit,
                 "power_usage": current_power
             })
@@ -62,7 +67,7 @@ class NVMLWrapper:
     def get_power_limit(self, handle):
         power_limit = c_uint()
         self.nvml_lib.nvmlDeviceGetPowerManagementLimit(handle, byref(power_limit))
-        return power_limit.value // 1000
+        return power_limit.value // 1000  # Convert to watts
 
     def set_power_limit(self, handle, limit):
         self.nvml_lib.nvmlDeviceSetPowerManagementLimit(handle, c_uint(limit * 1000))
@@ -70,7 +75,12 @@ class NVMLWrapper:
     def set_memory_frequency(self, handle, freq):
         self.nvml_lib.nvmlDeviceSetApplicationsClocks(handle, freq, freq)
 
+############################################
+# Main Script Functionality
+############################################
+
 def get_system_info():
+    """Collect and display basic system information."""
     system_info = {
         "OS": platform.system(),
         "Version": platform.version(),
@@ -80,69 +90,65 @@ def get_system_info():
         "Threads": psutil.cpu_count(logical=True),
         "RAM (Total)": f"{round(psutil.virtual_memory().total / (1024 ** 3), 2)} GB"
     }
+    return system_info
 
-    try:
-        nvml = NVMLWrapper()
+def display_live_info(stdscr):
+    """Display live system and GPU information using curses."""
+    nvml = NVMLWrapper()
+
+    while True:
+        stdscr.clear()
+
+        # Fetch system information
+        system_info = get_system_info()
+        stdscr.addstr(0, 0, "System Information:")
+        stdscr.addstr(1, 0, tabulate(system_info.items(), headers=["Component", "Details"], tablefmt="grid"))
+
+        # Display resource usage
+        cpu_usage = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        stdscr.addstr(3, 0, "\nResource Usage:")
+        stdscr.addstr(4, 0, f"CPU Usage: {cpu_usage}%")
+        stdscr.addstr(5, 0, f"RAM Usage: {ram.used / (1024 ** 3):.2f} GB / {ram.total / (1024 ** 3):.2f} GB")
+
+        # Display GPU information
         gpus = nvml.list_gpus()
-        print("System Information:")
-        print(tabulate(system_info.items(), headers=["Component", "Details"]))
-        print("\nGPU Information:")
-        gpu_info = []
         total_power = 0
         for gpu in gpus:
-            current_power = f"{gpu['power_usage']:.1f} W" if gpu['power_usage'] is not None else "N/A"
-            gpu_info.append([
-                f"GPU {gpu['id']}: {gpu['name']}",
-                f"Memory: {gpu['memory']} MB | Power Limit: {gpu['power_limit']} W | Current Usage: {current_power}"
-            ])
-            if gpu['power_usage'] is not None:
-                total_power += gpu['power_usage']
-        print(tabulate(gpu_info, headers=["GPU", "Specifications"]))
-        print(f"\nTotal GPU Power Consumption: {total_power:.1f} W")
-    except Exception as e:
-        print("\nWarning: Could not retrieve GPU information:", str(e))
-        print(tabulate(system_info.items(), headers=["Component", "Details"]))
+            current_power = gpu['power_usage']
+            if current_power is not None:
+                total_power += current_power
+            power_str = f"{current_power:.1f} W" if current_power is not None else "N/A"
+            stdscr.addstr(6 + gpu['id'], 0, f"GPU {gpu['id']} Power: {power_str}")
 
-def monitor_resources():
-    print("\nMonitoring Resources (Press Ctrl+C to exit):")
-    nvml = NVMLWrapper()
-    try:
-        while True:
-            cpu_usage = psutil.cpu_percent(interval=1)
-            ram = psutil.virtual_memory()
-            gpus = nvml.list_gpus()
-            os.system('clear' if os.name == 'posix' else 'cls')
-            system_info = [
-                ["CPU Usage", f"{cpu_usage} %"],
-                ["RAM Usage", f"{ram.used / (1024 ** 3):.2f} GB / {ram.total / (1024 ** 3):.2f} GB"],
-            ]
-            total_power = 0
-            for gpu in gpus:
-                current_power = gpu['power_usage']
-                if current_power is not None:
-                    total_power += current_power
-                power_str = f"{current_power:.1f} W" if current_power is not None else "N/A"
-                system_info.append([
-                    f"GPU {gpu['id']} Power",
-                    power_str
-                ])
-            system_info.append(["Total GPU Power", f"{total_power:.1f} W"])
-            print("Resource Usage:")
-            print(tabulate(system_info, headers=["Resource", "Usage"]))
-    except KeyboardInterrupt:
-        print("\nExiting resource monitoring.")
+        stdscr.addstr(6 + len(gpus), 0, f"Total GPU Power: {total_power:.1f} W")
 
-def configure_gpu():
-    nvml = NVMLWrapper()
+        # Display user options
+        stdscr.addstr(8 + len(gpus), 0, "\nPress 'c' to configure GPUs or 'q' to quit.")
+        stdscr.refresh()
+
+        # Handle user input
+        key = stdscr.getch()
+        if key == ord('q'):
+            break
+        elif key == ord('c'):
+            configure_gpu(nvml)
+
+def configure_gpu(nvml):
+    """Allow user to configure GPU settings."""
     gpus = nvml.list_gpus()
+
     print("Available GPUs:")
     for gpu in gpus:
         print(f"{gpu['id'] + 1}. {gpu['name']} (Memory: {gpu['memory']} MB, Power Limit: {gpu['power_limit']} W)")
+
     choice = int(input("Select GPU to configure (number): ")) - 1
     if 0 <= choice < len(gpus):
         gpu = gpus[choice]
         handle = c_void_p()
         nvml.nvml_lib.nvmlDeviceGetHandleByIndex_v2(gpu['id'], byref(handle))
+
+        # Set memory frequency
         mem_freq_input = input("Set memory frequency in MHz (press Enter to keep current): ").strip()
         if mem_freq_input:
             try:
@@ -151,8 +157,8 @@ def configure_gpu():
                 print(f"Memory Frequency updated to {mem_freq} MHz")
             except ValueError:
                 print("Invalid memory frequency value. Keeping current setting.")
-        else:
-            print("Keeping current memory frequency setting")
+
+        # Set power limit
         power_limit_input = input("Set power limit in W (press Enter to keep current): ").strip()
         if power_limit_input:
             try:
@@ -161,32 +167,14 @@ def configure_gpu():
                 print(f"Power limit updated to {power_limit} W")
             except ValueError:
                 print("Invalid power limit value. Keeping current setting.")
-        else:
-            print("Keeping current power limit setting")
+
         print(f"\nConfiguration complete for {gpu['name']}")
     else:
         print("Invalid selection.")
 
-def main():
-    while True:
-        print("\nMining Rig Management Tool")
-        print("1. View System Information")
-        print("2. Monitor Resource Usage")
-        print("3. Configure GPU Settings")
-        print("4. Exit")
-        choice = input("Enter your choice: ")
-        if choice == "1":
-            get_system_info()
-        elif choice == "2":
-            monitor_resources()
-        elif choice == "3":
-            configure_gpu()
-        elif choice == "4":
-            print("Exiting...")
-            break
-        else:
-            print("Invalid choice. Please try again.")
+def main(stdscr):
+    """Main function to display menu and handle user actions."""
+    display_live_info(stdscr)
 
 if __name__ == "__main__":
-    main()
-
+    curses.wrapper(main)
